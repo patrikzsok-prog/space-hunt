@@ -1,0 +1,169 @@
+
+name: Package SpaceHunt macOS Apple Silicon DMG
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package-mac:
+    runs-on: macos-15
+
+    steps:
+      # STEP 1 - Download and extract the prebuilt macOS ARM64 files
+      - name: Download and extract macOS build
+        shell: bash
+        env:
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p build/input
+
+          echo "Downloading SpaceHunt macOS ARM64 build..."
+
+          gh release download v1.0.0 \
+            --repo "$GH_REPOSITORY" \
+            --pattern "SpaceHunt-macOS-build-input.zip" \
+            --dir build
+
+          echo "Extracting ZIP..."
+
+          python3 - <<'PY'
+          from pathlib import Path, PurePosixPath
+          from shutil import copyfileobj
+          from zipfile import ZipFile
+
+          archive_path = Path("build/SpaceHunt-macOS-build-input.zip")
+          output_dir = Path("build/input")
+
+          with ZipFile(archive_path) as archive:
+              for entry in archive.infolist():
+                  normalized = entry.filename.replace("\\", "/")
+                  path = PurePosixPath(normalized)
+
+                  if path.is_absolute() or ".." in path.parts:
+                      raise ValueError(f"Unsafe ZIP path: {entry.filename}")
+
+                  destination = output_dir.joinpath(*path.parts)
+
+                  if entry.is_dir() or normalized.endswith("/"):
+                      destination.mkdir(parents=True, exist_ok=True)
+                  else:
+                      destination.parent.mkdir(parents=True, exist_ok=True)
+
+                      with archive.open(entry) as source:
+                          with destination.open("wb") as target:
+                              copyfileobj(source, target)
+          PY
+
+          test -f build/input/publish/SpaceHunt
+          test -f build/input/Info.plist
+          test -f build/input/SpaceHuntIcon.png
+
+          plutil -lint build/input/Info.plist
+
+          echo "Extraction completed!"
+
+      # STEP 2 - Verify Apple Silicon architecture
+      - name: Verify ARM64 architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          file build/input/publish/SpaceHunt
+
+          lipo -archs build/input/publish/SpaceHunt
+
+          lipo build/input/publish/SpaceHunt -verify_arch arm64
+
+          echo "ARM64 architecture verified!"
+
+      # STEP 3 - Create macOS icon
+      - name: Create macOS icon
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p build/SpaceHunt.iconset
+
+          for size in 16 32 128 256 512; do
+            sips -s format png -z "$size" "$size" \
+              build/input/SpaceHuntIcon.png \
+              --out "build/SpaceHunt.iconset/icon_${size}x${size}.png" >/dev/null
+
+            doubled=$((size * 2))
+
+            sips -s format png -z "$doubled" "$doubled" \
+              build/input/SpaceHuntIcon.png \
+              --out "build/SpaceHunt.iconset/icon_${size}x${size}@2x.png" >/dev/null
+          done
+
+          iconutil -c icns \
+            build/SpaceHunt.iconset \
+            -o build/SpaceHunt.icns
+
+          echo "SpaceHunt.icns created!"
+
+      # STEP 4 - Create macOS app bundle
+      - name: Create SpaceHunt.app
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP="build/SpaceHunt.app"
+
+          mkdir -p "$APP/Contents/MacOS"
+          mkdir -p "$APP/Contents/Resources"
+
+          cp -R build/input/publish/. "$APP/Contents/MacOS/"
+          cp build/input/Info.plist "$APP/Contents/Info.plist"
+          cp build/SpaceHunt.icns "$APP/Contents/Resources/SpaceHunt.icns"
+
+          chmod +x "$APP/Contents/MacOS/SpaceHunt"
+
+          plutil -lint "$APP/Contents/Info.plist"
+
+          echo "Applying ad-hoc code signature..."
+
+          codesign --force --deep --sign - "$APP"
+
+          codesign --verify --deep "$APP"
+
+          echo "SpaceHunt.app created!"
+
+      # STEP 5 - Create macOS DMG
+      - name: Create macOS DMG
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p build/dmg-content
+          mkdir -p build/output
+
+          ditto \
+            build/SpaceHunt.app \
+            build/dmg-content/SpaceHunt.app
+
+          ln -s /Applications build/dmg-content/Applications
+
+          hdiutil create \
+            -volname "Space Hunt" \
+            -srcfolder build/dmg-content \
+            -format UDZO \
+            -ov \
+            build/output/SpaceHunt-v1.0.0-macOS-AppleSilicon.dmg
+
+          echo "DMG created successfully!"
+
+      # STEP 6 - Upload finished DMG
+      - name: Upload macOS DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpaceHunt-macOS-AppleSilicon-DMG
+          path: build/output/*.dmg
+          if-no-files-found: error
+          retention-days: 30
